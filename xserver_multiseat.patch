@@ -1,0 +1,200 @@
+From: Pixo
+Subject: Add DRM lease manager support to modesetting driver and Glamor DRI3
+Origin: https://forum.level1techs.com/t/drm-lease-manager-service/197584/5
+
+Patch originally posted by Pixo on the Level1Techs forum (2024/12/19 20:03:00)
+for upstream xorg-server (MIT/X11 license) to integrate AGL's drm-lease-manager
+(libdlmclient).
+
+diff --git a/glamor/glamor_egl.c b/glamor/glamor_egl.c
+index 6e0fc6596..e9d704327 100644
+--- a/glamor/glamor_egl.c
++++ b/glamor/glamor_egl.c
+@@ -803,7 +803,13 @@ glamor_dri3_open_client(ClientPtr client,
+ 
+     fd = open(glamor_egl->device_path, O_RDWR|O_CLOEXEC);
+     if (fd < 0)
+-        return BadAlloc;
++    {
++        /* Lets try open render node because we may be running atop DRM lease */
++        glamor_egl->device_path = drmGetRenderDeviceNameFromFd(glamor_egl->fd);
++        fd = open(glamor_egl->device_path, O_RDWR|O_CLOEXEC);
++        if (fd < 0)
++            return BadAlloc;
++    }
+ 
+     /* Before FD passing in the X protocol with DRI3 (and increased
+      * security of rendering with per-process address spaces on the
+diff --git a/hw/xfree86/drivers/modesetting/driver.c b/hw/xfree86/drivers/modesetting/driver.c
+index 535f49d1d..186cbe1ae 100644
+--- a/hw/xfree86/drivers/modesetting/driver.c
++++ b/hw/xfree86/drivers/modesetting/driver.c
+@@ -63,6 +63,9 @@
+ #include <pciaccess.h>
+ #endif
+ #include "driver.h"
++/* dlmclient start */
++#include <libdlmclient/dlmclient.h>
++/* dlmclient end */
+ 
+ static void AdjustFrame(ScrnInfoPtr pScrn, int x, int y);
+ static Bool CloseScreen(ScreenPtr pScreen);
+@@ -219,6 +222,27 @@ get_passed_fd(void)
+     return -1;
+ }
+ 
++/* dlmclient start */
++static struct dlm_lease *
++get_dlm_lease(const char *dev)
++{
++    struct dlm_lease *dml_lease;
++
++    if ((NULL == dev) || ((strcmp(dev,"DLMClient")) == 0))
++        dev = SeatId;
++
++    dml_lease = dlm_get_lease(dev);
++
++    if (!dml_lease) {
++        xf86DrvMsg(-1, X_INFO, "Could not obtain lease for %s\n", dev);
++        return NULL;
++    }
++
++    xf86DrvMsg(-1, X_INFO, "Received lease for %s\n", dev);
++    return dml_lease;
++}
++/* dlmclient end */
++
+ static int
+ open_hw(const char *dev)
+ {
+@@ -267,6 +291,26 @@ check_outputs(int fd, int *count)
+     return ret;
+ }
+ 
++/* dlmclient start */
++static Bool
++probe_dlm(const char *dev)
++{
++    int fd;
++    struct dlm_lease *dml_lease;
++
++    dml_lease = get_dlm_lease(dev);
++    fd = dlm_lease_fd(dml_lease);
++    if (fd != -1) {
++        int ret = check_outputs(fd, NULL);
++        dlm_release_lease(dml_lease);
++        close(fd);
++        return ret;
++    }
++
++    return FALSE;
++}
++/* dlmclient end */
++
+ static Bool
+ probe_hw(const char *dev, struct xf86_platform_device *platform_dev)
+ {
+@@ -288,6 +332,11 @@ probe_hw(const char *dev, struct xf86_platform_device *platform_dev)
+         close(fd);
+         return ret;
+     }
++
++/* dlmclient start */
++    return probe_dlm(dev);
++/* dlmclient end */
++
+     return FALSE;
+ }
+ 
+@@ -869,6 +918,12 @@ FreeRec(ScrnInfoPtr pScrn)
+             ms_unwrap_property_requests(pScrn);
+             if (ms->pEnt->location.type == BUS_PCI)
+                 ret = drmClose(ms->fd);
++/* dlmclient start */
++            else if (ms->dlmLease) {
++                ret = close(ms->fd);
++                dlm_release_lease(ms->dlmLease);
++            }
++/* dlmclient end */
+             else
+ #ifdef XF86_PDEV_SERVER_FD
+                 if (!(ms->pEnt->location.type == BUS_PLATFORM &&
+@@ -1052,6 +1107,13 @@ ms_get_drm_master_fd(ScrnInfoPtr pScrn)
+     {
+         const char *devicename;
+         devicename = xf86FindOptionValue(ms->pEnt->device->options, "kmsdev");
++/* dlmclient start */
++        ms->dlmLease = get_dlm_lease(devicename);
++        if (ms->dlmLease) {
++            ms->fd_passed = TRUE;
++            ms->fd = dlm_lease_fd(ms->dlmLease);
++        } else
++/* dlmclient end */
+         ms->fd = open_hw(devicename);
+     }
+     if (ms->fd < 0)
+diff --git a/hw/xfree86/drivers/modesetting/driver.h b/hw/xfree86/drivers/modesetting/driver.h
+index 71aa8730e..fb0ccd979 100644
+--- a/hw/xfree86/drivers/modesetting/driver.h
++++ b/hw/xfree86/drivers/modesetting/driver.h
+@@ -45,6 +45,10 @@
+ #include "drmmode_display.h"
+ #define MS_LOGLEVEL_DEBUG 4
+ 
++/* dlmclient start */
++#include <libdlmclient/dlmclient.h>
++/* dlmclient end */
++
+ struct ms_vrr_priv {
+     Bool variable_refresh;
+ };
+@@ -96,6 +100,10 @@ typedef struct _modesettingRec {
+     int fd;
+     Bool fd_passed;
+ 
++/* dlmclient start */
++    struct dlm_lease *dlmLease;
++/* dlmclient end */
++
+     int Chipset;
+     EntityInfoPtr pEnt;
+ 
+diff --git a/hw/xfree86/drivers/modesetting/drmmode_display.c b/hw/xfree86/drivers/modesetting/drmmode_display.c
+index 48dccad73..4228c2554 100644
+--- a/hw/xfree86/drivers/modesetting/drmmode_display.c
++++ b/hw/xfree86/drivers/modesetting/drmmode_display.c
+@@ -57,6 +57,10 @@
+ 
+ #include "driver.h"
+ 
++/* dlmclient start */
++#include <libdlmclient/dlmclient.h>
++/* dlmclient end */
++
+ static Bool drmmode_xf86crtc_resize(ScrnInfoPtr scrn, int width, int height);
+ static PixmapPtr drmmode_create_pixmap_header(ScreenPtr pScreen, int width, int height,
+                                               int depth, int bitsPerPixel, int devKind,
+diff --git a/hw/xfree86/drivers/modesetting/meson.build b/hw/xfree86/drivers/modesetting/meson.build
+index 02852a716..997a7f129 100644
+--- a/hw/xfree86/drivers/modesetting/meson.build
++++ b/hw/xfree86/drivers/modesetting/meson.build
+@@ -20,6 +20,7 @@ shared_module(
+         udev_dep,
+         libdrm_dep,
+         gbm_dep,
++        libdlmclient_dep,
+     ],
+ 
+     install: true,
+diff --git a/meson.build b/meson.build
+index 9e54a0a6f..4e5d68dbf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -68,6 +68,7 @@ wayland_protocols_req = '>= 1.18'
+ gbm_req = '>= 10.2'
+ xf86dgaproto_req = '>= 2.0.99.1'
+ 
++libdlmclient_dep = dependency('libdlmclient')
+ xproto_dep = dependency('xproto', version: '>= 7.0.31', fallback: ['xorgproto', 'ext_xorgproto'])
+ randrproto_dep = dependency('randrproto', version: '>= 1.6.0', fallback: ['xorgproto', 'ext_xorgproto'])
+ renderproto_dep = dependency('renderproto', version: '>= 0.11', fallback: ['xorgproto', 'ext_xorgproto'])

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: 0BSD
+
+# multiseat.service
+# Runner for the proof-of-concept multiseat setup.
+
+# Shalin Pather
+# shalin.pather01@gmail.com
+# 2026/11/21
+
+[Unit]
+Description=Multiseat runner
+After=systemd-user-sessions.service
+Conflicts=display-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/run-seat.sh
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
